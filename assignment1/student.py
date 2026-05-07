@@ -1,10 +1,8 @@
 """
 Negacyclic Number Theoretic Transform (NTT) implementation.
 
-GPU-optimized using reshape-based GS-DIF butterflies with Montgomery
-multiplication. The negacyclic twist is merged with the first butterfly
-stage to eliminate one data pass. The last stage skips the twiddle
-multiply since MonMul(diff, R) = diff (identity in Montgomery domain).
+GS-DIF with reshape-based butterflies and Montgomery multiplication.
+Unrolled Python loop gives XLA full visibility for cross-stage fusion.
 """
 
 import jax
@@ -64,27 +62,23 @@ def prepare_tables(*, q, psi_powers, twiddles):
     R = (1 << 32) % q_int
     q_inv_int = _precompute_q_inv(q_int)
 
-    psi_powers_mont = (psi_powers.astype(jnp.uint64) * R % q_int).astype(
-        jnp.uint32
-    )
+    psi_mont = np.empty(N, dtype=np.uint64)
+    cur = 1
+    for i in range(N):
+        psi_mont[i] = (cur * R) % q_int
+        cur = (cur * psi_val) % q_int
+    psi_mont = jnp.array(psi_mont, dtype=jnp.uint32)
 
-    half = N >> 1
-    psi_lo = psi_powers_mont[:half]
-    psi_hi = psi_powers_mont[half:]
-
-    stage_twiddles = []
-    for stage_idx in range(log2N):
-        s = log2N - stage_idx
-        m = 1 << s
-        half_m = m >> 1
-        omega_m = pow(omega, N // m, q_int)
-
+    tw_stages = []
+    for s in range(log2N):
+        half_m = N >> (s + 1)
+        omega_step = pow(omega, 1 << s, q_int)
         tw = np.empty(half_m, dtype=np.uint64)
         w = 1
         for j in range(half_m):
             tw[j] = (w * R) % q_int
-            w = (w * omega_m) % q_int
-        stage_twiddles.append(jnp.array(tw, dtype=jnp.uint32))
+            w = (w * omega_step) % q_int
+        tw_stages.append(jnp.array(tw, dtype=jnp.uint32))
 
     bit_rev = np.zeros(N, dtype=np.int32)
     for i in range(N):
@@ -96,9 +90,8 @@ def prepare_tables(*, q, psi_powers, twiddles):
     bit_rev = jnp.array(bit_rev, dtype=jnp.int32)
 
     _CACHED_TABLES = {
-        "psi_lo": psi_lo,
-        "psi_hi": psi_hi,
-        "stage_twiddles": stage_twiddles,
+        "psi_mont": psi_mont,
+        "tw_stages": tw_stages,
         "bit_rev": bit_rev,
         "N": N,
         "log2N": log2N,
@@ -120,73 +113,44 @@ def ntt(x, *, q, psi_powers, twiddles):
     log2N = tables["log2N"]
     q_int = tables["q_int"]
     q_inv_int = tables["q_inv_int"]
-    psi_lo = tables["psi_lo"]
-    psi_hi = tables["psi_hi"]
-    stage_twiddles = tables["stage_twiddles"]
+    psi_mont = tables["psi_mont"]
+    tw_stages = tables["tw_stages"]
     bit_rev = tables["bit_rev"]
 
-    q_u64 = jnp.uint64(q_int)
-    q_u32 = jnp.uint32(q_int)
-    q_inv_u32 = jnp.uint32(q_inv_int)
+    q64 = jnp.uint64(q_int)
+    q32 = jnp.uint32(q_int)
+    qi32 = jnp.uint32(q_inv_int)
+    B = x.shape[0]
 
-    batch = x.shape[0]
-    half = N >> 1
+    def mont(a, b):
+        z = a.astype(jnp.uint64) * b.astype(jnp.uint64)
+        m = z.astype(jnp.uint32) * qi32
+        t = (z + m.astype(jnp.uint64) * q64) >> 32
+        r = t.astype(jnp.uint32)
+        return jnp.where(r >= q32, r - q32, r)
 
-    # Stage 0: merged negacyclic twist + first GS-DIF butterfly
-    u_raw = x[:, :half]
-    v_raw = x[:, half:]
+    def madd(a, b):
+        s = a + b
+        return jnp.where(s >= q32, s - q32, s)
 
-    z = u_raw.astype(jnp.uint64) * psi_lo.astype(jnp.uint64)
-    m = z.astype(jnp.uint32) * q_inv_u32
-    t = (z + m.astype(jnp.uint64) * q_u64) >> 32
-    u = t.astype(jnp.uint32)
-    u = jnp.where(u >= q_u32, u - q_u32, u)
+    def msub(a, b):
+        return jnp.where(a >= b, a - b, a + q32 - b)
 
-    z = v_raw.astype(jnp.uint64) * psi_hi.astype(jnp.uint64)
-    m = z.astype(jnp.uint32) * q_inv_u32
-    t = (z + m.astype(jnp.uint64) * q_u64) >> 32
-    v = t.astype(jnp.uint32)
-    v = jnp.where(v >= q_u32, v - q_u32, v)
+    x = mont(x, psi_mont)
 
-    s_val = u + v
-    new_even = jnp.where(s_val >= q_u32, s_val - q_u32, s_val)
-    diff = jnp.where(u >= v, u - v, u + q_u32 - v)
+    for s in range(log2N):
+        num_groups = 1 << s
+        half_m = N >> (s + 1)
 
-    tw = stage_twiddles[0]
-    z = diff.astype(jnp.uint64) * tw.astype(jnp.uint64)
-    m = z.astype(jnp.uint32) * q_inv_u32
-    t = (z + m.astype(jnp.uint64) * q_u64) >> 32
-    t = t.astype(jnp.uint32)
-    new_odd = jnp.where(t >= q_u32, t - q_u32, t)
+        x = x.reshape(B, num_groups, 2, half_m)
+        top = x[:, :, 0, :]
+        bot = x[:, :, 1, :]
 
-    x = jnp.stack([new_even, new_odd], axis=1).reshape(batch, N)
+        sum_val = madd(top, bot)
+        diff = msub(top, bot)
+        prod = mont(diff, tw_stages[s])
 
-    # Stages 1 through log2N-1
-    for stage_idx in range(1, log2N):
-        s = log2N - stage_idx
-        m_val = 1 << s
-        half_m = m_val >> 1
-        num_groups = N // m_val
-
-        x = x.reshape(batch, num_groups, 2, half_m)
-        u = x[:, :, 0, :]
-        v = x[:, :, 1, :]
-
-        s_val = u + v
-        new_even = jnp.where(s_val >= q_u32, s_val - q_u32, s_val)
-        diff = jnp.where(u >= v, u - v, u + q_u32 - v)
-
-        if half_m == 1:
-            new_odd = diff
-        else:
-            tw = stage_twiddles[stage_idx]
-            z = diff.astype(jnp.uint64) * tw.astype(jnp.uint64)
-            m = z.astype(jnp.uint32) * q_inv_u32
-            t = (z + m.astype(jnp.uint64) * q_u64) >> 32
-            t = t.astype(jnp.uint32)
-            new_odd = jnp.where(t >= q_u32, t - q_u32, t)
-
-        x = jnp.stack([new_even, new_odd], axis=2).reshape(batch, N)
+        x = jnp.stack([sum_val, prod], axis=2).reshape(B, N)
 
     x = x[:, bit_rev]
     return x
