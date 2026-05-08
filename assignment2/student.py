@@ -296,37 +296,178 @@ def _sumcheck_impl(eval_tables, *, q, expression, challenges, num_rounds,
 
 
 def sumcheck_32(eval_tables, *, q, expression, challenges, num_rounds):
-    """Compulsory 32-bit sumcheck path."""
-    return _sumcheck_impl(
-        eval_tables,
-        q=q,
-        expression=expression,
-        challenges=challenges,
-        num_rounds=num_rounds,
-        mod_add_fn=mod_add_32,
-        mod_sub_fn=mod_sub_32,
-        mod_mul_fn=mod_mul_32,
-        mle_update_fn=mle_update_32,
-        mod_sum_fn=_mod_sum_32,
-        arr_dtype=jnp.uint32,
-    )
+    """Optimized 32-bit sumcheck with Barrett reduction (avoids % on GPU)."""
+    q_int = int(q)
+    q64 = jnp.uint64(q_int)
+
+    _r16 = jnp.uint64(pow(2, 16, q_int))
+    _r32 = jnp.uint64(pow(2, 32, q_int))
+    _r48 = jnp.uint64((pow(2, 16, q_int) * pow(2, 32, q_int)) % q_int)
+    _inv_q = jnp.uint64((1 << 63) // q_int)
+    _M16 = jnp.uint64(0xFFFF)
+
+    def _reduce(z):
+        s = (z & _M16) + ((z >> 16) & _M16) * _r16 + \
+            ((z >> 32) & _M16) * _r32 + (z >> 48) * _r48
+        approx = ((s >> 31).astype(jnp.uint32).astype(jnp.uint64) * _inv_q) >> 32
+        r = s - approx * q64
+        return jnp.where(r >= q64, r - q64, r).astype(jnp.uint32)
+
+    def _mmul(a, b):
+        return _reduce(a.astype(jnp.uint64) * b.astype(jnp.uint64))
+
+    def _madd(a, b):
+        s = a.astype(jnp.uint64) + b.astype(jnp.uint64)
+        return jnp.where(s >= q64, s - q64, s).astype(jnp.uint32)
+
+    def _msub(a, b):
+        a64, b64 = a.astype(jnp.uint64), b.astype(jnp.uint64)
+        return jnp.where(a64 >= b64, a64 - b64, a64 + q64 - b64).astype(jnp.uint32)
+
+    def _mle(zero, one, t):
+        return _madd(_mmul(_msub(one, zero), t), zero)
+
+    degree = max(len(term) for term in expression)
+    num_eval_pts = degree + 1
+
+    tables = {k: jnp.asarray(v, dtype=jnp.uint32) for k, v in eval_tables.items()}
+    all_round_evals = []
+
+    for round_idx in range(num_rounds):
+        even = {name: tables[name][0::2] for name in tables}
+        odd = {name: tables[name][1::2] for name in tables}
+        half_n = even[next(iter(even))].shape[0]
+
+        eval_sums = []
+        for t in range(num_eval_pts):
+            if t == 0:
+                ext = even
+            elif t == 1:
+                ext = odd
+            else:
+                t_scalar = jnp.asarray(t, dtype=jnp.uint32)
+                ext = {
+                    name: _mle(even[name], odd[name], t_scalar)
+                    for name in tables
+                }
+
+            comp = jnp.zeros(half_n, dtype=jnp.uint32)
+            for term in expression:
+                term_val = ext[term[0]]
+                for var in term[1:]:
+                    term_val = _mmul(term_val, ext[var])
+                comp = _madd(comp, term_val)
+
+            eval_sums.append(
+                _reduce(jnp.sum(comp.astype(jnp.uint64), dtype=jnp.uint64))
+            )
+
+        all_round_evals.append(jnp.stack(eval_sums))
+
+        if round_idx < len(challenges):
+            r = challenges[round_idx]
+            for name in tables:
+                tables[name] = _mle(even[name], odd[name], r)
+
+    claim0 = _madd(all_round_evals[0][0], all_round_evals[0][1])
+    round_evals_array = jnp.stack(all_round_evals)
+    return claim0, round_evals_array
 
 
 def sumcheck_64(eval_tables, *, q, expression, challenges, num_rounds):
-    """64-bit sumcheck path."""
-    return _sumcheck_impl(
-        eval_tables,
-        q=q,
-        expression=expression,
-        challenges=challenges,
-        num_rounds=num_rounds,
-        mod_add_fn=mod_add_64,
-        mod_sub_fn=mod_sub_64,
-        mod_mul_fn=mod_mul_64,
-        mle_update_fn=mle_update_64,
-        mod_sum_fn=_mod_sum_64,
-        arr_dtype=jnp.uint64,
-    )
+    """Optimized 64-bit sumcheck path with inlined arithmetic."""
+    q_int = int(q)
+    q64 = jnp.uint64(q_int)
+
+    def _madd(a, b):
+        a64 = jnp.asarray(a, dtype=jnp.uint64)
+        b64 = jnp.asarray(b, dtype=jnp.uint64)
+        s = a64 + b64
+        overflow = s < a64
+        needs_reduce = overflow | (s >= q64)
+        return jnp.where(needs_reduce, s - q64, s)
+
+    def _msub(a, b):
+        a64 = jnp.asarray(a, dtype=jnp.uint64)
+        b64 = jnp.asarray(b, dtype=jnp.uint64)
+        diff = a64 - b64
+        return jnp.where(a64 >= b64, diff, diff + q64)
+
+    def _mmul(a, b):
+        a64 = jnp.asarray(a, dtype=jnp.uint64)
+        b64 = jnp.asarray(b, dtype=jnp.uint64)
+        a64, b64 = jnp.broadcast_arrays(a64, b64)
+        def body(i, state):
+            r, mult = state
+            i_u64 = jnp.asarray(i, dtype=jnp.uint64)
+            bit = (b64 >> i_u64) & jnp.uint64(1)
+            addend = jnp.where(bit != jnp.uint64(0), mult, jnp.zeros_like(mult))
+            s = r + addend
+            overflow = s < r
+            r = jnp.where(overflow | (s >= q64), s - q64, s)
+            s2 = mult + mult
+            overflow2 = s2 < mult
+            mult = jnp.where(overflow2 | (s2 >= q64), s2 - q64, s2)
+            return (r, mult)
+        r0 = jnp.zeros_like(a64)
+        r_final, _ = jax.lax.fori_loop(0, 64, body, (r0, a64))
+        return r_final
+
+    def _mle(zero, one, t):
+        return _madd(_mmul(_msub(one, zero), t), zero)
+
+    def _mod_sum(arr):
+        cur = arr.astype(jnp.uint64)
+        while cur.shape[0] > 1:
+            if cur.shape[0] % 2 == 1:
+                cur = jnp.concatenate([cur, jnp.zeros((1,), dtype=jnp.uint64)])
+            half = cur.shape[0] // 2
+            cur = _madd(cur[:half], cur[half:])
+        return cur[0]
+
+    degree = max(len(term) for term in expression)
+    num_eval_pts = degree + 1
+
+    tables = {k: jnp.asarray(v, dtype=jnp.uint64) for k, v in eval_tables.items()}
+    all_round_evals = []
+
+    for round_idx in range(num_rounds):
+        even = {name: tables[name][0::2] for name in tables}
+        odd = {name: tables[name][1::2] for name in tables}
+        half_n = even[next(iter(even))].shape[0]
+
+        eval_sums = []
+        for t in range(num_eval_pts):
+            if t == 0:
+                ext = even
+            elif t == 1:
+                ext = odd
+            else:
+                t_scalar = jnp.asarray(t, dtype=jnp.uint64)
+                ext = {
+                    name: _mle(even[name], odd[name], t_scalar)
+                    for name in tables
+                }
+
+            comp = jnp.zeros(half_n, dtype=jnp.uint64)
+            for term in expression:
+                term_val = ext[term[0]]
+                for var in term[1:]:
+                    term_val = _mmul(term_val, ext[var])
+                comp = _madd(comp, term_val)
+
+            eval_sums.append(_mod_sum(comp))
+
+        all_round_evals.append(jnp.stack(eval_sums))
+
+        if round_idx < len(challenges):
+            r = challenges[round_idx]
+            for name in tables:
+                tables[name] = _mle(even[name], odd[name], r)
+
+    claim0 = _madd(all_round_evals[0][0], all_round_evals[0][1])
+    round_evals_array = jnp.stack(all_round_evals)
+    return claim0, round_evals_array
 
 
 def sumcheck_128(eval_tables, *, q, expression, challenges, num_rounds):
